@@ -47,11 +47,15 @@ def _crf_viterbi_forward(F, num_tags, transitions, inputs, scores):
     new_scores = F.where(mask,
                          emission + F.max(transition_scores, axis=1),
                          scores)
-    return path, new_scores
+    return [path, new_scores], new_scores
 
 
-def _crf_viterbi_backward(F, path, last_tag):
-    best_tag = F.pick(path, last_tag, axis=1)
+def _crf_viterbi_backward(F, inputs, last_tag):
+    path, scores, mask = inputs
+
+    best_tag = F.where(mask,
+                       F.pick(path, last_tag, axis=1),
+                       F.argmax(scores, axis=1))
     return best_tag, best_tag
 
 
@@ -75,30 +79,28 @@ def viterbi_decode(transitions, emissions, mask=None):
     best_tags_list = []
     # start transtion
     # (seq_length, batch_size, num_tags)
-    viterbi_score = np.zeros_like(emissions, dtype=np.float32)
-    viterbi_score[0] = emissions[0]
+    viterbi_scores = np.zeros_like(emissions, dtype=np.float32)
+    viterbi_scores[0] = emissions[0]
     # (seq_length, batch_size, num_tags)
-    viterbi_path = np.zeros_like(emissions, dtype=np.int64)
+    viterbi_paths = np.zeros_like(emissions, dtype=np.int64)
 
     # use dynamic programing to compute the viterbi score
     for i, emission in enumerate(emissions[1:]):
         # (batch_size, num_tags, 1)
-        broadcast_log_prob = viterbi_score[i].reshape((-1, num_tags, 1))
-        # (batch_size, 1, num_tags)
-        #broadcast_emission = emission.reshape((-1, 1, num_tags))
+        broadcast_log_prob = viterbi_scores[i].reshape((-1, num_tags, 1))
         # (batch_size, num_tags, num_tags)
         score = broadcast_log_prob + transitions
-        score.argmax(axis=1, out=viterbi_path[i])
-        viterbi_score[i + 1] = emission + score.max(axis=1)
+        viterbi_paths[i] = score.argmax(axis=1)
+        viterbi_scores[i + 1] = emission + score.max(axis=1)
     # search best path for each batch according to the viterbi score
     # get the best tag for the last emission
     for idx in range(batch_size):
         seq_end_idx = sequence_lengths[idx] - 1
-        best_last_tag = viterbi_score[seq_end_idx, idx].argmax()
+        best_last_tag = viterbi_scores[seq_end_idx, idx].argmax()
         best_tags = [best_last_tag]
         # trace back all best tags based on the last best tag and viterbi path
 
-        for path in np.flip(viterbi_path[:sequence_lengths[idx] - 1], 0):
+        for path in np.flip(viterbi_paths[:sequence_lengths[idx] - 1], 0):
             best_last_tag = path[idx][best_tags[-1]]
             best_tags.append(best_last_tag)
         best_tags.reverse()
@@ -116,31 +118,34 @@ class ViterbiDecoder(nn.HybridBlock):
                 'transitions', value=transitions)
 
     def hybrid_forward(self, F, emissions, mask, transitions):
-        viterbi_paths, last_scores = F.contrib.foreach(
+        (viterbi_paths, viterbi_scores), last_scores = F.contrib.foreach(
             functools.partial(
                 _crf_viterbi_forward, F, self.num_tags, transitions),
-            [F.slice(emissions, begin=(1, None), end=(None, None)),
-             F.slice(mask, begin=(1, None), end=(None, None))],
+            [F.slice_axis(emissions, axis=0, begin=1, end=None),
+             F.slice_axis(mask, axis=0, begin=1, end=None)],
             _slice(F, emissions, begin=0, end=1, axis=0))
         last_tag = F.argmax(last_scores, axis=1)
         best_path, _ = F.contrib.foreach(
             functools.partial(_crf_viterbi_backward, F),
-            F.SequenceReverse(viterbi_paths), last_tag)
+            [F.SequenceReverse(viterbi_paths),
+             F.SequenceReverse(viterbi_scores),
+             F.slice(mask, begin=(-1, None), end=(0, None), step=(-1, 1))],
+            last_tag)
         best_path = F.concat(last_tag.reshape((1, -1)), best_path, dim=0)
         return F.SequenceReverse(best_path), F.max(last_scores, axis=1)
 
 
 def _crf_unary_score(F, inputs, states):
     emission, cur_tag, mask = inputs
-    # add emission score for current tag if current tag is not masked
     scores = F.pick(emission, cur_tag, axis=1)
+    # add emission score for current tag if current tag is not masked
     return [], F.where(mask, scores + states, states)
 
 
 def _crf_binary_score(F, transitions, inputs, states):
     cur_tag, next_tag, mask = inputs
-    # add transition score to next tag if next tag is not masked
     scores = F.gather_nd(transitions, F.stack(cur_tag, next_tag))
+    # add transition score to next tag if next tag is not masked
     return [], F.where(mask, scores + states, states)
 
 
@@ -210,7 +215,8 @@ class Crf(nn.HybridBlock):
 
 
 if __name__ == '__main__':
-    seq_length, batch_size, num_tags = 4, 1, 5
+    mx.random.seed(280)
+    seq_length, batch_size, num_tags = 4, 2, 5
     mask = nd.array([[1, 1], [1, 1], [1, 0], [1, 0]])
     tags = nd.array([[0, 1], [2, 4], [3, 1], [1, 0]])
     m = Crf(num_tags)
@@ -225,7 +231,7 @@ if __name__ == '__main__':
          [0.6382, -0.2460, 2.3025, -1.8817, -0.0497]],
         [[-0.8383, 0.0009, -0.7504, 0.1854, 0.6211],
          [0.6382, -0.2460, 2.3025, -1.8817, -0.0497]]])
-    m.transitions.set_data(mx.nd.array([
+    m.transitions.set_data(nd.array([
         [-0.0693, -0.1000, 0.0145, 0.0948, 0.0549],
         [-0.0347, 0.0900, -0.0808, -0.0608, -0.0277],
         [-0.0747, -0.0884, -0.0698, 0.0517, -0.0683],
