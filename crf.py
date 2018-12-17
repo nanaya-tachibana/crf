@@ -1,6 +1,7 @@
+import numpy as np
+import numba
 import functools
 
-import numpy as np
 import mxnet as mx
 
 from mxnet import nd, init
@@ -21,18 +22,19 @@ def log_sum_exp(F, arr, axis=1):
     """
     offset = F.max(arr, axis=axis, keepdims=True)
     safe_sum = F.log(F.sum(F.exp(F.broadcast_minus(arr, offset)), axis=axis))
-    return F.squeeze(offset) + safe_sum
+    return F.squeeze(offset, axis=axis) + safe_sum
 
 
-def _slice(F, t, begin, end):
-    return F.squeeze(F.slice(t, begin=begin, end=end))
+def _slice(F, t, begin, end, axis=None):
+    return F.squeeze(F.slice_axis(t, begin=begin, end=end, axis=axis),
+                     axis=axis)
 
 
 def _broadcast_score(F, num_tags, transitions, log_probs):
     # (batch_size, num_tags, 1)
     broadcast_log_probs = F.reshape(log_probs, shape=(-1, num_tags, 1))
     # (batch_size, num_tags, num_tags)
-    return F.broadcast_add(broadcast_log_probs, transitions)
+    return F.broadcast_add(broadcast_log_probs, transitions, name='one')
 
 
 def _crf_viterbi_forward(F, num_tags, transitions, inputs, scores):
@@ -53,6 +55,57 @@ def _crf_viterbi_backward(F, path, last_tag):
     return best_tag, best_tag
 
 
+@numba.jit
+def viterbi_decode(transitions, emissions, mask=None):
+    """
+    transitions: numpy array, shape(num_tags, num_tags)
+    start_transitions: numpy array, shape(num_tags)
+    end_transitions: numpy array, shape(num_tags)
+    emissions: numpy array, shape(seq_length, batch_size, num_tags)
+    mask: numpy array, shape(seq_length, batch_size)
+    """
+    seq_legnth, batch_size, num_tags = emissions.shape
+
+    if mask is None:
+        mask = np.ones((seq_legnth, batch_size))
+    assert mask[0].all()
+
+    sequence_lengths = mask.sum(axis=0).astype(np.int64)
+    # list to store the decode paths
+    best_tags_list = []
+    # start transtion
+    # (seq_length, batch_size, num_tags)
+    viterbi_score = np.zeros_like(emissions, dtype=np.float32)
+    viterbi_score[0] = emissions[0]
+    # (seq_length, batch_size, num_tags)
+    viterbi_path = np.zeros_like(emissions, dtype=np.int64)
+
+    # use dynamic programing to compute the viterbi score
+    for i, emission in enumerate(emissions[1:]):
+        # (batch_size, num_tags, 1)
+        broadcast_log_prob = viterbi_score[i].reshape((-1, num_tags, 1))
+        # (batch_size, 1, num_tags)
+        #broadcast_emission = emission.reshape((-1, 1, num_tags))
+        # (batch_size, num_tags, num_tags)
+        score = broadcast_log_prob + transitions
+        score.argmax(axis=1, out=viterbi_path[i])
+        viterbi_score[i + 1] = emission + score.max(axis=1)
+    # search best path for each batch according to the viterbi score
+    # get the best tag for the last emission
+    for idx in range(batch_size):
+        seq_end_idx = sequence_lengths[idx] - 1
+        best_last_tag = viterbi_score[seq_end_idx, idx].argmax()
+        best_tags = [best_last_tag]
+        # trace back all best tags based on the last best tag and viterbi path
+
+        for path in np.flip(viterbi_path[:sequence_lengths[idx] - 1], 0):
+            best_last_tag = path[idx][best_tags[-1]]
+            best_tags.append(best_last_tag)
+        best_tags.reverse()
+        best_tags_list.append(best_tags)
+    return best_tags_list
+
+
 class ViterbiDecoder(nn.HybridBlock):
 
     def __init__(self, num_tags, transitions, prefix='viterbi_'):
@@ -64,30 +117,31 @@ class ViterbiDecoder(nn.HybridBlock):
 
     def hybrid_forward(self, F, emissions, mask, transitions):
         viterbi_paths, last_scores = F.contrib.foreach(
-            functools.partial(_crf_viterbi_forward, F, num_tags, transitions),
+            functools.partial(
+                _crf_viterbi_forward, F, self.num_tags, transitions),
             [F.slice(emissions, begin=(1, None), end=(None, None)),
              F.slice(mask, begin=(1, None), end=(None, None))],
-            _slice(F, emissions, begin=(0, None), end=(1, None)))
+            _slice(F, emissions, begin=0, end=1, axis=0))
         last_tag = F.argmax(last_scores, axis=1)
         best_path, _ = F.contrib.foreach(
             functools.partial(_crf_viterbi_backward, F),
             F.SequenceReverse(viterbi_paths), last_tag)
         best_path = F.concat(last_tag.reshape((1, -1)), best_path, dim=0)
-        return F.SequenceReverse(best_path) * mask, F.max(last_scores, axis=1)
+        return F.SequenceReverse(best_path), F.max(last_scores, axis=1)
 
 
 def _crf_unary_score(F, inputs, states):
     emission, cur_tag, mask = inputs
     # add emission score for current tag if current tag is not masked
-    scores = F.pick(emission, cur_tag, axis=1) * mask
-    return [], states + scores
+    scores = F.pick(emission, cur_tag, axis=1)
+    return [], F.where(mask, scores + states, states)
 
 
 def _crf_binary_score(F, transitions, inputs, states):
     cur_tag, next_tag, mask = inputs
     # add transition score to next tag if next tag is not masked
-    scores = F.gather_nd(transitions, F.stack(cur_tag, next_tag)) * mask
-    return [], states + scores
+    scores = F.gather_nd(transitions, F.stack(cur_tag, next_tag))
+    return [], F.where(mask, scores + states, states)
 
 
 def _crf_log_norm(F, num_tags, transitions, inputs, log_probs):
@@ -96,7 +150,8 @@ def _crf_log_norm(F, num_tags, transitions, inputs, log_probs):
     transition_scores = _broadcast_score(F, num_tags, transitions, log_probs)
     # (batch_size, num_tags)
     scores = log_sum_exp(F, transition_scores, axis=1)
-    return [], F.where(mask, emission + scores, log_probs)
+    scores = F.broadcast_add(emission, scores, name='two')
+    return [], F.where(mask, scores, log_probs)
 
 
 class Crf(nn.HybridBlock):
@@ -128,18 +183,16 @@ class Crf(nn.HybridBlock):
         tags: shape(seq_length, batch_size)
         mask: shape(seq_length, batch_size)
         """
-        llh = F.zeros_like(_slice(
-            F, tags, begin=(0, None), end=(1, None)))
+        llh = F.zeros_like(_slice(F, tags, begin=0, end=1, axis=0))
 
         _, llh = F.contrib.foreach(
             functools.partial(_crf_unary_score, F),
             [emissions, tags, mask], llh)
 
-        cur_tags = F.slice_axis(tags, axis=0, begin=0, end=-1)
-        next_tags = F.slice_axis(tags, axis=0, begin=1, end=None)
         _, llh = F.contrib.foreach(
             functools.partial(_crf_binary_score, F, transitions),
-            [cur_tags, next_tags,
+            [F.slice_axis(tags, axis=0, begin=0, end=-1),
+             F.slice_axis(tags, axis=0, begin=1, end=None),
              F.slice_axis(mask, axis=0, begin=1, end=None)], llh)
         return llh
 
@@ -150,16 +203,16 @@ class Crf(nn.HybridBlock):
         """
         _, log_probs = F.contrib.foreach(
             functools.partial(_crf_log_norm, F, self.num_tags, transitions),
-            [F.slice(emissions, begin=(1, None), end=(None, None)),
-             F.slice(mask, begin=(1, None), end=(None, None))],
-            _slice(F, emissions, begin=(0, None), end=(1, None)))
+            [F.slice_axis(emissions, axis=0, begin=1, end=None),
+             F.slice_axis(mask, axis=0, begin=1, end=None)],
+            _slice(F, emissions, begin=0, end=1, axis=0))
         return log_sum_exp(F, log_probs, axis=1)
 
 
 if __name__ == '__main__':
-    seq_length, batch_size, num_tags = 3, 2, 5
-    mask = nd.array([[1, 1], [1, 1], [1, 0]])
-    tags = nd.array([[0, 1], [2, 4], [3, 1]])
+    seq_length, batch_size, num_tags = 4, 1, 5
+    mask = nd.array([[1, 1], [1, 1], [1, 0], [1, 0]])
+    tags = nd.array([[0, 1], [2, 4], [3, 1], [1, 0]])
     m = Crf(num_tags)
     m.initialize(init=init.Xavier())
     m.hybridize()
@@ -168,6 +221,8 @@ if __name__ == '__main__':
          [0.1778, -0.2303, -0.3918, -1.5810, 1.7066]],
         [[-0.4462, 0.7440, 1.5210, 3.4105, -1.1256],
          [-0.3170, -1.0925, -0.0852, -0.0933, 0.6871]],
+        [[-0.4462, 0.7440, 1.5210, 3.4105, -1.1256],
+         [0.6382, -0.2460, 2.3025, -1.8817, -0.0497]],
         [[-0.8383, 0.0009, -0.7504, 0.1854, 0.6211],
          [0.6382, -0.2460, 2.3025, -1.8817, -0.0497]]])
     m.transitions.set_data(mx.nd.array([
@@ -176,15 +231,14 @@ if __name__ == '__main__':
         [-0.0747, -0.0884, -0.0698, 0.0517, -0.0683],
         [0.0845, -0.0411, -0.0849, -0.0357, -0.0408],
         [0.0506, -0.0526, -0.0175, -0.0538, 0.0537]]))
-
     assert abs(m(emissions, tags, mask).sum().asscalar()
-               - (-8.072865)) <= 1e-4
+               - (-8.493363)) <= 1e-4
     assert abs(m(emissions, tags, mx.nd.ones_like(tags)).sum().asscalar()
-               - (-10.966491)) <= 1e-4
+               - (-13.35252)) <= 1e-4
 
-    # with mx.autograd.record():
-    #     loss = m(emissions, tags, mask)
-    # loss.backward()
+    with mx.autograd.record():
+        loss = m(emissions, tags, mask)
+    loss.backward()
 
     transitions = m.transitions.data()
     decoder = ViterbiDecoder(num_tags, transitions)
@@ -192,15 +246,17 @@ if __name__ == '__main__':
     decoder.hybridize()
 
     paths, scores = decoder(emissions, mask)
-    assert paths.asnumpy().T.astype(np.int).tolist() == \
-        [[0, 3, 4], [4, 4, 0]]
+    paths = [path[:m.sum().asscalar()].asnumpy().tolist()
+             for path, m in zip(paths.T, mask.T)]
+    assert paths == [[0, 3, 3, 4], [4, 4]]
 
     scores = scores.asnumpy()
     mask = mx.nd.ones_like(tags)
     paths, scores = decoder(emissions, mask)
-    assert paths.asnumpy().T.astype(np.int).tolist() == \
-        [[0, 3, 4], [4, 4, 2]]
+    paths = [path[:m.sum().asscalar()].asnumpy().tolist()
+             for path, m in zip(paths.T, mask.T)]
+    assert paths == [[0, 3, 3, 4], [4, 4, 2, 2]]
     scores = scores.asnumpy()
-    assert abs(scores[0] - 5.0239) <= 1e-4
-    assert abs(scores[1] - 4.7324) <= 1e-4
+    assert abs(scores[0] - 8.398701) <= 1e-4
+    assert abs(scores[1] - 6.9651003) <= 1e-4
     print('All tests passed')
