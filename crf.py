@@ -200,7 +200,7 @@ class Crf(nn.HybridBlock):
         Computes the normalization of sequence.
 
         \alpha = \sum_{y_t \in S, y_{t-1} \in S} \
-        \sum_{t=0}^{T - 1} M(y_{t-1}, y_{t}) + \sum_{t=0}^{T} f(x_{t - 1})
+        \sum_{t=0}^{T-1} M(y_{t-1}, y_{t}) + \sum_{t=0}^{T} f(x_{t-1}, y_{t-1})
 
         Parameters:
         ----
