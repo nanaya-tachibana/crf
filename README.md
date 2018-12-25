@@ -16,8 +16,8 @@ Examples
 
 
 ```Python
-	import mxnet as mx
-	seq_length, batch_size, num_tags = 4, 2, 5
+    import mxnet as mx
+    seq_length, batch_size, num_tags = 4, 2, 5
     mask = nd.array([[1, 1], [1, 1], [1, 0], [1, 0]])
     tags = nd.array([[0, 1], [2, 4], [3, 1], [1, 0]])
     m = Crf(num_tags)
@@ -52,7 +52,7 @@ Computing log likelihood
 Decoding
 ----
 ```Python
-	>>> transitions = m.transitions.data().asnumpy()
+    >>> transitions = m.transitions.data().asnumpy()
     >>> emissions = emissions.asnumpy()
     >>> mask = mask.asnumpy()
     >>> viterbi_decode(transitions, emissions, mask))
