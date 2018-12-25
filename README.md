@@ -44,9 +44,9 @@ Examples
 Computing log likelihood
 -----
 ```Python
-	>>> m(emissions, tags, mask)
-	[-5.2060437 -3.2873197]
-	<NDArray 2 @cpu(0)>
+    >>> m(emissions, tags, mask)
+        [-5.2060437 -3.2873197]
+        <NDArray 2 @cpu(0)>
 ```
 
 Decoding
