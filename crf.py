@@ -70,7 +70,7 @@ def log_sum_exp(F, arr, axis=1):
 
     Parameters:
     ----
-    F: mx.ndarray or mx.symbol
+    F: mxnet.Symbol or mxnet.ndarray
     arr: any shape
          Input array
     axis: int
@@ -172,6 +172,7 @@ class Crf(nn.HybridBlock):
 
         Parameters:
         ----
+        F: mxnet.Symbol or mxnet.ndarray
         emissions: shape(seq_length, batch_size, num_tags)
         tags: shape(seq_length, batch_size)
         mask: shape(seq_length, batch_size)
